@@ -1,0 +1,628 @@
+---
+title: "Multi-species Occupancy Models in STAN"
+author: "Christopher Rota & Arielle Parsons"
+date: "October 7, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Why go Bayes?
+
+As we saw in the example using MARK, adding too many slope coefficients can result in difficulty estimating some parameters.  This can be resolved by adding penalties to those slope coefficients that shrink estimates toward 0.  In principle, one could use restricted maximum likelihood (I've not seen this applied) to do this.  Alternatively, one could also use Bayesian methods and impose a weakly informative priors to shrink coefficients toward 0.  Alternatively, using a Bayesian framework makes it much easier (for me at least) to include mixed-effects models.
+
+We have explored a few different Bayesian computation programs (e.g., BUGS, JAGS) and found [STAN](http://mc-stan.org/) to be the most efficient *by far*.  STAN is substantially different from the BUGS language, so we will start with a single-season occupancy model to demonstrate some basics of the language.
+
+### Marginal Likelihood
+
+A big way STAN is different from BUGS is that it doesn't permit use of *discrete* latent variables.  This means we have to write the marginal likelihood.  Let's take a few minutes to discuss what a marginal likelihood is.  Note -- we'll also return to this later when creating plots of marginal occupancy probability!
+
+Consider the PMF of a 2-species multivariate Bernoulli model:
+
+$f(z_1,z_2) = \psi_{11}^{z_1z_2} \psi_{10}^{z_1(1-z_2)} \psi_{01}^{(1-z_1)z_2} \psi_{00}^{(1-z_1)(1-z_2)}$.
+
+Suppose we wish to calculate the likelihoodd of species 1 occurring, regardless of whether species 2 was present or absent.  We do this by *marginalizing* over all possible values of $z_2$.  For discrete random variables like $Z$, this involves summing over all possible values of that variable.  For example:
+
+$f(z_1) = \sum_{z_2=0}^1 \psi_{11}^{z_1z_2} \psi_{10}^{z_1(1-z_2)} \psi_{01}^{(1-z_1)z_2} \psi_{00}^{(1-z_1)(1-z_2)}$
+
+$=\psi_{10}^{z_1} \psi_{00}^{(1-z_1)} + \psi_{11}^{z_1} \psi_{01}^{(1-z_1)}$
+
+$=(\psi_{10} + \psi_{11})^{z_1}(\psi_{01} + \psi_{00})^{1-z_1}$
+
+Alternatively, consider a single season occupancy model:
+
+$y_{ij} \sim \text{Bernoulli}(z_ip_{ij})$
+
+$z_i \sim \text{Bernoulli}(\psi_i)$
+
+We can write the joint distribution of $y$ and $z$ as follows:
+
+$f(y_{ij}, z_i) = \psi_i^{z_i}(1-\psi_i)^{1-z_i} \prod_{j=i}^j (z_ip_{ij})^{y_ij} (1-z_ip_{ij})^{1-y_{ij}}$
+
+Where we get into trouble with STAN is that it can't handle these latent $z$s.  We therefore need to *marginalize* over $z$ to fit this model in STAN.  The marginal distribution of $y$ can be written as:
+
+$f(y_{ij}) = \sum_{z_i=0}^1 \psi_i^{z_i}(1-\psi_i)^{1-z_i} \prod_{j=i}^J (z_ip_{ij})^{y_{ij}} (1-z_ip_{ij})^{1-y_{ij}}$
+
+$= \psi_i \prod_{j=1}^J p_{ij}^{y_{ij}}(1-p_{ij})^{1-y_{ij}} + (1-\psi_i)\prod_{j=1}^J 0^{y_{ij}}$
+
+Notice that we no longer have $z$ in the marginal likelihood, and we are now good to start fitting single-species occupancy models in STAN!
+
+### Some STAN Preliminaries
+
+Two ways STAN differs from the BUGS language is the need to specify program blocks, and the need to be *very* precise when specifying variable types.  Let's start with program blocks.  The program blocks we will need are as follows:
+
+```{stan, eval = F, output.var = 'something'}
+data{
+  // list exactly all of the data you will import
+}
+parameters{
+  // assign name and variable type to all of your model parameters
+}
+transformed parameters{
+  // calculate linear functions, calculate marginal likelihood here
+}
+model{
+  // specify prior distributions, tell STAN what your likelihood is here
+}
+```
+
+Let's fill these in one at a time.  Suppose we have a single-species occupancy model with 1 detection and 1 occupancy covariate.  We conduct $J=3$ replicate surveys at each site.  Our data might include a design matrix for occupancy covariates, a design matrix for detection covariates, and a matrix of detection / non-detection data at each site.  Our data block might then look like:
+
+```{stan, eval = F, output.var = 'something'}
+data{
+  int J;  // number of replicate observations
+  int N;  // number of sites
+  
+  vector[J] y[N];  // detection / non-detection data
+  vector[N] ind;   // = 1 if species detected at least once at site i, 0 otherwise
+  
+  matrix[N, 2] x;        // occupancy covariates
+  row_vector[2] w[N, J]; // detection covariates
+}
+```
+
+Notice how precise we must be when specifying data types: we use `int` to denote data is an integer; `matrix` to denote data is a matrix; and a mixture of data type and variable names to indicate an array.  For example, we use `row_vector[2] w[N, J]` to indicate detection covariates are specified in an $N \times J \times 2$ array.  Furthermore, this declaration indicates that element `w[1, 1]` is a row vector of length 2.  More details on variable types are in the [Modeling Language User's Guide and Reference Manual, Version 2.17.0](https://github.com/stan-dev/stan/releases/download/v2.17.0/stan-reference-2.17.0.pdf).  Finally, notice that we must end each line with a semi-colon `;`.
+
+Let's explore the `parameters` block next:
+
+```{stan, eval = F, output.var = 'something'}
+parameters{
+
+  vector[2] alpha;  // detection covariates
+  vector[2] beta;   // occupancy covariates
+  
+}
+```
+
+Just like we declare variable types within the data block, we also have to declare what type of variable our parameters are in the `parameters` block.  In fact, whenever we define a variable within STAN, we always have to declare what type of variable it is.  Here, we simpl say our paramters are vectors of length 2 (an intercept and slope coefficient for detection and occupancy models, respectively).
+
+Let's explore the `transformed parameters` block next:
+
+```{stan, eval = F, output.var = 'something'}
+transformed parameters{
+
+  // variable declaration
+  vector[N] psi;
+  vector[J] p[N];
+  vector[N] mar_lik;
+  
+  psi = inv_logit(x * beta);  // probability of occurrence
+  
+  for(i in 1:N){  // looping through all N sites
+  
+    for(j in 1:J){  // looping through all J surveys
+    
+      p[i, j] = inv_logit(w[i, j] * alpha);  // detection probability
+    
+    }
+  
+    // marginal likelihood
+    mar_lik[i] =
+      psi[i] * prod(exp(y[i] .* log(p[i]) + (1 - y[i]) .* log(1 - p[i]))) +
+      (1 - psi[i]) * (1 - ind[i]);
+  }
+  
+}
+```
+
+Notice a few things here:
+
+- We declare variable names and types at the beginning of the block before we actually assign a value to these variables.
+- STAN is largely vectorized.  For example, we do not need to include `psi = inv_logit(x * beta);` within the loop.
+- STAN recognizes matrix math, and does it quickly.  For example, `x * beta` produces a vector of length $N$, which is why I declared `psi` a vector.
+- Exponentiation functions `^` and `pow()` are *not* vectorized.  The workaround is to use `prod(exp(log()))`.  There might be a more efficient way to do this.
+- Assignment is made with the `=` key, instead of the more familiar left arrow `<-` in BUGS and R
+
+Finally, let's specify the model:
+
+```{stan, eval = F, output.var = 'something'}
+model{
+
+  alpha ~ logistic(0, 1);
+  beta ~ logistic(0, 1);
+  target += log(mar_lik);
+  
+}
+```
+
+Here, we declare logistic(0, 1) prior distributions on all slope coefficients.  Because STAN is vectorized, we don't have to loop through all values here.  You may have also noticed earlier that the likelihood for $y$ doesn't follow any standard probability distribution.  This is no problem in STAN.  If you wish to specify a non-standard likelihood, all you have to use is the `target +=` statement.  No 'tricks' like in BUGS or JAGS.  The model declaration is that easy!
+
+Okay, let's pull all of these parts together to fully specify a STAN model:
+
+```{stan, output.var = 'model.stan', results = 'hide'}
+data{
+  int J;  // number of replicate observations
+  int N;  // number of sites
+  
+  vector[J] y[N];  // detection / non-detection data
+  vector[N] ind;   // = 1 if species detected at least once at site i, 0 otherwise
+  
+  matrix[N, 2] x;        // occupancy covariates
+  row_vector[2] w[N, J]; // detection covariates
+}
+
+parameters{
+
+  vector[2] alpha;  // detection covariates
+  vector[2] beta;   // occupancy covariates
+  
+}
+
+transformed parameters{
+
+  // variable declaration
+  vector[N] psi;
+  vector[J] p[N];
+  vector[N] mar_lik;
+  
+  psi = inv_logit(x * beta);  // probability of occurrence
+  
+  for(i in 1:N){  // looping through all N sites
+  
+    for(j in 1:J){  // looping through all J surveys
+    
+      p[i, j] = inv_logit(w[i, j] * alpha);  // detection probability
+    
+    }
+  
+    // marginal likelihood
+    mar_lik[i] =
+      psi[i] * prod(exp(y[i] .* log(p[i]) + (1 - y[i]) .* log(1 - p[i]))) +
+      (1 - psi[i]) * (1 - ind[i]);
+  }
+  
+}
+
+model{
+
+  alpha ~ logistic(0, 1);
+  beta ~ logistic(0, 1);
+  target += log(mar_lik);
+  
+}
+
+```
+
+# Running a model from RStan
+
+While STAN's authors wrote a modeling language with a much different syntax than BUGS, they wrote an interface to R that works almost exactly the same a `R2WinBUGS`, `R2OpenBUGS`, and `jagsUI`.  This means that if you are already familiar with how to read data into one of these applications, you won't have to re-learn everything to run STAN.  First, let's read in the Bobcat data you used in the MARK exercise and prepare it for output to STAN:
+
+```{r, results = 'hide'}
+# reading in data
+y <- read.csv('data/Bobcat_3wk.csv')  # bobcat detection / non-detection data
+x <- read.csv('data/psi_cov3wk.csv')  # site level covariates
+w <- read.csv('data/detection data.csv')   # detection-level covariates
+
+# creating design matrix for detection / non-detection data
+dm_w <- array(1, dim = c(nrow(y), ncol(y), 2))
+dm_w[, 1, 2] <- scale(w)[, 1]
+dm_w[, 2, 2] <- scale(w)[, 2]
+dm_w[, 3, 2] <- scale(w)[, 3]
+
+# creating a list for output to stan
+data <- list(
+  J = ncol(y),  # no. replicate observations
+  N = nrow(y),  # no. sites
+  y = as.matrix(y),  # detection / non-detection data
+  ind = apply(as.matrix(y), 1, max),  # is bobcat detected at least once?
+  x = cbind(rep(1, nrow(y)), scale(x$Dist_5km)),  # site-level design matrix
+  w = dm_w  # detection-level design matrix
+)
+```
+
+A great thing about the data block in STAN is that you know exactly what data must be provided (I don't know about you, but sometimes I forget to load something into JAGS or BUGS because data can be scattered about the code).  Next, we indicate what parameters must be monitored, just like with `R2WinBUGS`, `R2OpenBUGS`, and `jagsUI`:
+
+```{r, results = 'hide'}
+params <- c('alpha', 'beta')
+```
+
+We can write a function to supply initial values, just like with `R2WinBUGS`, `R2OpenBUGS`, and `jagsUI`:
+
+```{r, results = 'hide'}
+inits <- function(){
+  list(
+    alpha = rnorm(2),
+    beta = rnorm(2)
+  )
+}
+
+```
+
+Finally, we send the model off to STAN:
+
+```{r, results = 'hide', message = FALSE}
+library(rstan)
+options(mc.cores = parallel::detectCores())  # for parallel processing
+
+fit <- sampling(model.stan, data = data, pars = params, chains = 3,
+            init = inits, iter = 2000, warmup = 1000, thin = 1, cores = 3)
+```
+
+And now we can check out results:
+```{r}
+fit
+```
+
+# Multi-species occupancy models in STAN
+
+Ok, we fit a single-season occupancy model in STAN, but you all came to learn about multi-species models!  The hard work is done -- learning how to write a Bayesian model in STAN.  Now we just need to add a few tweaks to get a multi-species model running.  Let's fit one of the 3-species models we fit in MARK.  First, we have to think about how to write the marginal likelihood.  The mechanics are equivalent from the 1-species model.  We now just have a couple of more $z$'s to marginalize over.  Recall our model:
+
+$y_{sij} \sim \text{Bernoulli}(p_{sij}z_{si})$
+
+$\boldsymbol{Z}_i \sim \text{Multivariate Bernoulli}(\boldsymbol{\Psi}_i)$
+
+For a 3-species model, we can write the joint distribution of the $y$'s and $\boldsymbol{Z}$ as:
+
+$f(\boldsymbol{y}_{1i}, \boldsymbol{y}_{2i}, \boldsymbol{y}_{3i}, \boldsymbol{Z}_i) = \psi_{i111} ^ {z_{i1} z_{i2} z_{i3}}
+\psi_{i110} ^ {z_{i1} z_{i2} (1 - z_{i3})}
+\psi_{i101} ^ {z_{i1} (1 - z_{i2}) z_{i3}}
+\psi_{i100} ^ {z_{i1} (1 - z_{i2}) (1 - z_{i3})}
+\psi_{i011} ^ {(1 - z_{i1}) z_{i2} z_{i3}}
+\psi_{i010} ^ {(1 - z_{i1}) z_{i2} (1 - z_{i3})}
+\psi_{i001} ^ {(1 - z_{i1}) (1 - z_{i2}) z_{i3}}
+\psi_{i000} ^ {(1 - z_{i1}) (1 - z_{i2}) (1 - z_{i3})} \times \\ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ \ 
+\prod_{j=1}^J (z_{i1}p_{1ij}) ^ {y_{1ij}} (1 - z_{i1}p_{1ij}) ^ {(1 - y_{1ij})}
+(z_{i2}p_{2ij}) ^ {y_{2ij}} (1 - z_{i2}p_{2ij}) ^ {(1 - y_{2ij})}
+(z_{i3}p_{3ij}) ^ {y_{3ij}} (1 - z_{i3}p_{3ij}) ^ {(1 - y_{3ij})}$
+
+Yes, this looks ugly, but the mechanics are exactly the same as the 1-species model.  The marginal distribution of the $y$'s involve summing over all possible combinations of 1s and 0s:
+
+$f(\boldsymbol{y}_{1i}, \boldsymbol{y}_{2i}, \boldsymbol{y}_{3i}) =
+\sum_{\boldsymbol{Z}} f(\boldsymbol{y}_{1i}, \boldsymbol{y}_{2i}, \boldsymbol{y}_{3i}, \boldsymbol{Z}_i)$
+
+$=
+\psi_{i111} \prod_{j=1}^J
+(p_{1ij}) ^ {y_{1ij}} (1 - p_{1ij}) ^ {(1 - y_{1ij})}
+(p_{2ij}) ^ {y_{2ij}} (1 - p_{2ij}) ^ {(1 - y_{2ij})}
+(p_{3ij}) ^ {y_{3ij}} (1 - p_{3ij}) ^ {(1 - y_{3ij})} +\\ \ \ \ \
+\psi_{i110} \prod_{j=1}^J
+(p_{1ij}) ^ {y_{1ij}} (1 - p_{1ij}) ^ {(1 - y_{1ij})}
+(p_{2ij}) ^ {y_{2ij}} (1 - p_{2ij}) ^ {(1 - y_{2ij})}
+0 ^ {y_{3ij}} +\\ \ \ \ \
+\psi_{i101} \prod_{j=1}^J
+(p_{1ij}) ^ {y_{1ij}} (1 - p_{1ij}) ^ {(1 - y_{1ij})}
+0 ^ {y_{2ij}}
+(p_{3ij}) ^ {y_{3ij}} (1 - p_{3ij}) ^ {(1 - y_{3ij})} +\\ \ \ \ \
+\psi_{i100} \prod_{j=1}^J
+(p_{1ij}) ^ {y_{1ij}} (1 - p_{1ij}) ^ {(1 - y_{1ij})}
+0 ^ {y_{2ij}}
+0 ^ {y_{3ij}} +\\ \ \ \ \
+\psi_{i011} \prod_{j=1}^J
+0 ^ {y_{1ij}}
+(p_{2ij}) ^ {y_{2ij}} (1 - p_{2ij}) ^ {(1 - y_{2ij})}
+(p_{3ij}) ^ {y_{3ij}} (1 - p_{3ij}) ^ {(1 - y_{3ij})} +\\ \ \ \ \
+\psi_{i010} \prod_{j=1}^J
+0 ^ {y_{1ij}}
+(p_{2ij}) ^ {y_{2ij}} (1 - p_{2ij}) ^ {(1 - y_{2ij})}
+0 ^ {y_{3ij}} +\\ \ \ \ \
+\psi_{i001} \prod_{j=1}^J
+0 ^ {y_{1ij}}
+0 ^ {y_{2ij}}
+(p_{3ij}) ^ {y_{3ij}} (1 - p_{3ij}) ^ {(1 - y_{3ij})} +\\ \ \ \ \
+\psi_{i000} \prod_{j=1}^J
+0 ^ {y_{1ij}}
+0 ^ {y_{2ij}}
+0 ^ {y_{3ij}}$
+
+Most of the changes in STAN will come in the `transformed parameters` block:
+
+```{stan, eval = F, output.var = 'something'}
+transformed parameters{
+
+  // defining variable type
+  matrix[N, 7] f; // natural parameters
+  vector[8] num[N]; // numerator of multinomial logit link
+  vector[8] psi[N]; // probability of each combination of 1 and 0
+  vector[J] p[S, N]; // detection probability
+  vector[N] py[S]; // probability of sequence of detections at site i
+  vector[N] mar_lik; // marginal likelihood
+  
+  // natural parameters
+  f[1:N, 1] = x1 * beta[1];  // f1
+  f[1:N, 2] = x1 * beta[2];  // f2
+  f[1:N, 3] = x1 * beta[3];  // f3
+  f[1:N, 4] = x2 * beta[4];  // f12
+  f[1:N, 5] = x2 * beta[5];  // f13
+  f[1:N, 6] = x2 * beta[6];  // f23
+  f[1:N, 7] = rep_vector(0, N);  // f123
+  
+  for(i in 1:N){  // looping through all sites
+  
+    // intermediate step -- numerator of multinomial logit
+    num[i, 1] = sum(f[i, 1:7]);              // 111
+    num[i, 2] = f[i, 1] + f[i, 2] + f[i, 4]; // 110
+    num[i, 3] = f[i, 1] + f[i, 3] + f[i, 5]; // 101
+    num[i, 4] = f[i, 1];                     // 100
+    num[i, 5] = f[i, 2] + f[i, 3] + f[i, 6]; // 011
+    num[i, 6] = f[i, 2];                     // 010
+    num[i, 7] = f[i, 3];                     // 001
+    num[i, 8] = 0;                           // 000
+  
+    psi[i] = softmax(num[i]);  // multinomial logit link function
+    
+    for(j in 1:J){  // looping through all replicate surveys
+    
+      // detection probability
+      p[1, i, j] = inv_logit(w[i, j] * alpha[1]);
+      p[2, i, j] = inv_logit(w[i, j] * alpha[2]);
+      p[3, i, j] = inv_logit(w[i, j] * alpha[3]);
+    
+    }
+    
+    // probability of detection history.
+    // calculate once now so I don't have to keep doing later
+    py[1, i] = prod(exp(y[1, i] .* log(p[1, i]) +
+                    (1 - y[1, i]) .* log(1 - p[1, i])));
+    py[2, i] = prod(exp(y[2, i] .* log(p[2, i]) +
+                    (1 - y[2, i]) .* log(1 - p[2, i])));
+    py[3, i] = prod(exp(y[3, i] .* log(p[3, i]) +
+                    (1 - y[3, i]) .* log(1 - p[3, i])));
+              
+    
+    // marginal likelihood
+    mar_lik[i] =
+      psi[i][1] * py[1, i] * py[2, i] * py[3, i] +                     // 111
+      psi[i][2] * py[1, i] * py[2, i] * (1 - ind[i, 3]) +              // 110
+      psi[i][3] * py[1, i] * (1 - ind[i, 2]) * py[3, i] +              // 101
+      psi[i][4] * py[1, i] * (1 - ind[i, 2]) * (1 - ind[i, 3]) +       // 100
+      psi[i][5] * (1 - ind[i, 1]) * py[2, i] * py[3, i] +              // 011
+      psi[i][6] * (1 - ind[i, 1]) * py[2, i] * (1 - ind[i, 3]) +       // 010
+      psi[i][7] * (1 - ind[i, 1]) * (1 - ind[i, 2]) * py[3, i] +       // 001
+      psi[i][8] * (1 - ind[i, 1]) * (1 - ind[i, 2]) * (1 - ind[i, 3]); // 000
+      
+  }
+
+}
+```
+
+We'll also need to make some minor changes to the `data` block:
+
+```{stan, eval = F, output.var = 'somewhere'}
+data{
+  int J;  // number of replicate observations
+  int N;  // number of sites
+  int S;  // number of species
+  
+  vector[J] y[S, N];  // detection / non-detection data
+  matrix[N, S] ind;   // = 1 if species detected at least once
+  
+  matrix[N, 2] x1;        // occupancy covariates
+  matrix[N, 2] x2;        // occupancy covariates
+  row_vector[2] w[N, J]; // detection covariates
+}
+```
+
+And to the `parameters` block:
+
+```{stan, eval = F, output.var = 'somewhere'}
+parameters{
+
+  vector[2] alpha[3];  // detection covariates
+  vector[2] beta[6];   // occupancy covariates
+  
+}
+```
+
+STAN is vectorized, but still needs to loop through *arrays* when specifying prior distributions:
+
+```{stan, eval = F, output.var = 'something'}
+model{
+
+  for(s in 1:S){
+    alpha[s] ~ logistic(0, 1);
+  }
+  
+  for(t in 1:6){
+    beta[t] ~ logistic(0, 1);
+  }
+  
+  
+  target += log(mar_lik);
+  
+}
+```
+
+Let's piece it all together into one big model!
+
+```{stan, output.var = 'model_3sp'}
+data{
+  int J;  // number of replicate observations
+  int N;  // number of sites
+  int S;  // number of species
+  
+  vector[J] y[S, N];  // detection / non-detection data
+  matrix[N, S] ind;   // = 1 if species detected at least once
+  
+  matrix[N, 2] x1;        // occupancy covariates
+  matrix[N, 2] x2;        // occupancy covariates
+  row_vector[2] w[N, J]; // detection covariates
+}
+
+parameters{
+
+  vector[2] alpha[3];  // detection covariates
+  vector[2] beta[6];   // occupancy covariates
+  
+}
+
+transformed parameters{
+
+  // defining variable type
+  matrix[N, 7] f; // natural parameters
+  vector[8] num[N]; // numerator of multinomial logit link
+  vector[8] psi[N]; // probability of each combination of 1 and 0
+  vector[J] p[S, N]; // detection probability
+  vector[N] py[S]; // probability of sequence of detections at site i
+  vector[N] mar_lik; // marginal likelihood
+  
+  // natural parameters
+  f[1:N, 1] = x1 * beta[1];  // f1
+  f[1:N, 2] = x1 * beta[2];  // f2
+  f[1:N, 3] = x1 * beta[3];  // f3
+  f[1:N, 4] = x2 * beta[4];  // f12
+  f[1:N, 5] = x2 * beta[5];  // f13
+  f[1:N, 6] = x2 * beta[6];  // f23
+  f[1:N, 7] = rep_vector(0, N);  // f123
+  
+  for(i in 1:N){  // looping through all sites
+  
+    // intermediate step -- numerator of multinomial logit
+    num[i, 1] = sum(f[i, 1:7]);              // 111
+    num[i, 2] = f[i, 1] + f[i, 2] + f[i, 4]; // 110
+    num[i, 3] = f[i, 1] + f[i, 3] + f[i, 5]; // 101
+    num[i, 4] = f[i, 1];                     // 100
+    num[i, 5] = f[i, 2] + f[i, 3] + f[i, 6]; // 011
+    num[i, 6] = f[i, 2];                     // 010
+    num[i, 7] = f[i, 3];                     // 001
+    num[i, 8] = 0;                           // 000
+  
+    psi[i] = softmax(num[i]);  // multinomial logit link function
+    
+    for(j in 1:J){  // looping through all replicate surveys
+    
+      // detection probability
+      p[1, i, j] = inv_logit(w[i, j] * alpha[1]);
+      p[2, i, j] = inv_logit(w[i, j] * alpha[2]);
+      p[3, i, j] = inv_logit(w[i, j] * alpha[3]);
+    
+    }
+    
+    // probability of detection history.
+    // calculate once now so I don't have to keep doing later
+    py[1, i] = prod(exp(y[1, i] .* log(p[1, i]) +
+                    (1 - y[1, i]) .* log(1 - p[1, i])));
+    py[2, i] = prod(exp(y[2, i] .* log(p[2, i]) +
+                    (1 - y[2, i]) .* log(1 - p[2, i])));
+    py[3, i] = prod(exp(y[3, i] .* log(p[3, i]) +
+                    (1 - y[3, i]) .* log(1 - p[3, i])));
+              
+    
+    // marginal likelihood
+    mar_lik[i] =
+      psi[i][1] * py[1, i] * py[2, i] * py[3, i] +                     // 111
+      psi[i][2] * py[1, i] * py[2, i] * (1 - ind[i, 3]) +              // 110
+      psi[i][3] * py[1, i] * (1 - ind[i, 2]) * py[3, i] +              // 101
+      psi[i][4] * py[1, i] * (1 - ind[i, 2]) * (1 - ind[i, 3]) +       // 100
+      psi[i][5] * (1 - ind[i, 1]) * py[2, i] * py[3, i] +              // 011
+      psi[i][6] * (1 - ind[i, 1]) * py[2, i] * (1 - ind[i, 3]) +       // 010
+      psi[i][7] * (1 - ind[i, 1]) * (1 - ind[i, 2]) * py[3, i] +       // 001
+      psi[i][8] * (1 - ind[i, 1]) * (1 - ind[i, 2]) * (1 - ind[i, 3]); // 000
+      
+  }
+
+}
+
+model{
+
+  for(s in 1:S){
+    alpha[s] ~ logistic(0, 1);
+  }
+  
+  for(t in 1:6){
+    beta[t] ~ logistic(0, 1);
+  }
+  
+  
+  target += log(mar_lik);
+  
+}
+
+```
+
+Let's read in data as before, this time including all 3 species:
+
+```{r}
+# reading in data
+bob <- read.csv('data/Bobcat_3wk.csv')  # bobcat detection / non-detection data
+coy <- read.csv('data/Coyote_3wk.csv')  # coyote detection / non-detection data
+fox <- read.csv('data/RedFox_3wk.csv')  # fox detection / non-detection data
+x <- read.csv('data/psi_cov3wk.csv')  # site level covariates
+w <- read.csv('data/detection data.csv')   # detection-level covariates
+
+# putting detection / non-detection data into an array
+y <- array(dim = c(3, nrow(bob), ncol(bob)))
+y[1, , ] <- as.matrix(bob)
+y[2, , ] <- as.matrix(coy)
+y[3, , ] <- as.matrix(fox)
+
+# creating design matrix for detection / non-detection data
+dm_w <- array(1, dim = c(nrow(bob), ncol(bob), 2))
+dm_w[, 1, 2] <- scale(w)[, 1]
+dm_w[, 2, 2] <- scale(w)[, 2]
+dm_w[, 3, 2] <- scale(w)[, 3]
+
+# creating a list for output to stan
+data <- list(
+  J = ncol(bob),  # no. replicate observations
+  N = nrow(bob),  # no. sites
+  S = 3,  # number of species
+  y = y,  # detection / non-detection data
+  ind = cbind(apply(as.matrix(bob), 1, max), # is species detected?
+              apply(as.matrix(coy), 1, max),
+              apply(as.matrix(fox), 1, max)),  
+  x1 = cbind(rep(1, nrow(bob)), # 1st order design matrix
+             scale(x$Dist_5km)[, 1]),
+  x2 = cbind(rep(1, nrow(bob)), # 2nd order design matrix
+             scale(x$HDens_5km)[, 1]),
+  w = dm_w  # detection-level design matrix
+)
+```
+
+We'll specify parameters to monitor:
+
+```{r, results = 'hide'}
+params <- c('alpha', 'beta')
+```
+
+tweak the `inits()` function:
+
+```{r, results = 'hide'}
+inits <- function(){
+  list(
+    alpha = matrix(rnorm(3 * 2), nrow = 3),
+    beta = matrix(rnorm(2 * 6), nrow = 6)
+  )
+}
+
+```
+
+send the model off to STAN:
+
+```{r, results = 'hide', message = FALSE}
+library(rstan)
+options(mc.cores = parallel::detectCores())  # for parallel processing
+
+fit_3sp <- sampling(model_3sp, data = data, pars = params, chains = 3,
+                    init = inits, iter = 2000, warmup = 1000, thin = 1,
+                    cores = 3)
+```
+
+and view results:
+
+```{r}
+fit_3sp
+```
+
+Now, as an exercise, I leave it to you to fit the model that gave Arielle so much trouble in MARK.  You'll need to change several elements of your model, including the design matrices in the data block and dimenstions in the parameter block.
