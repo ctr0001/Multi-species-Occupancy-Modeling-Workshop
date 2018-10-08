@@ -44,7 +44,7 @@ summary(hd)
 
 #Create an empty matrix with rows equal to the # iterations
 #columns equal to the length of hd for each of the 
-#8 unique capture histories possible (3 interacting species)
+#8 unique combinations of 1s and 0s (3 interacting species)
 #This will hold the overall occupancy estimates
 psi <- array(dim = c(8, nrow(b), length(hd)))
 
@@ -80,7 +80,8 @@ for(i in 1:nrow(b)){
     f[6] <- crossprod(c(1, 0, hd[j]), b[i, 6, 1:3])[1, 1]  # f23
     
 ######################## Step 6 ###############################
-    #Calculate the probabilities of each unique capture history
+    #Calculate the probabilities of each unique 
+    #combination of 1s and 0s
     #This is the numerator necessary to calculate occupancy 
     #probabilities
     n <- numeric(6)
@@ -94,14 +95,15 @@ for(i in 1:nrow(b)){
     n[8] <- 1                       # 000
     
 ######################### Step 7 ###############################
-    #Calculate Psi: Divide the probability of each capture 
-    #history by the sum of capture history probabilities
+    #Calculate Psi: Divide the probability of each unique 
+    #combination of 1s and 0s by the sum of probabilities
+    #over all combinations
     psi[, i, j] <- n / sum(n)
 
 ######################### Step 8 ###############################
     #Calculate the marginal Psi probabilities for 
-    #each species by summing the Psi's for only those capture 
-    #histories where that species was present
+    #each species by summing the Psi's for only those combinations
+    #where that species was present
     bob[i, j] <- sum(psi[1:4, i, j])
     coy[i, j] <- sum(psi[c(1:2, 5:6), i, j])
     red[i, j] <- sum(psi[c(1, 3, 5, 7), i, j])
