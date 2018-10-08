@@ -615,7 +615,7 @@ library(rstan)
 options(mc.cores = parallel::detectCores())  # for parallel processing
 
 fit_3sp <- sampling(model_3sp, data = data, pars = params, chains = 3,
-                    init = inits, iter = 2000, warmup = 1000, thin = 1,
+                    init = inits, iter = 200, warmup = 100, thin = 1,
                     cores = 3)
 ```
 
@@ -626,3 +626,173 @@ fit_3sp
 ```
 
 Now, as an exercise, I leave it to you to fit the model that gave Arielle so much trouble in MARK.  You'll need to change several elements of your model, including the design matrices in the data block and dimenstions in the parameter block.
+
+Here is the model Arielle last fit in MARK
+
+```{stan, output.var = 'model_3sp_MARK'}
+data{
+  int J;  // number of replicate observations
+  int N;  // number of sites
+  int S;  // number of species
+  
+  vector[J] y[S, N];  // detection / non-detection data
+  matrix[N, S] ind;   // = 1 if species detected at least once
+  
+  matrix[N, 3] x;        // occupancy covariates
+  row_vector[2] w[N, J]; // detection covariates
+}
+
+parameters{
+
+  vector[2] alpha[3];  // detection covariates
+  vector[3] beta[6];   // occupancy covariates
+  
+}
+
+transformed parameters{
+
+  // defining variable type
+  matrix[N, 7] f; // natural parameters
+  vector[8] num[N]; // numerator of multinomial logit link
+  vector[8] psi[N]; // probability of each combination of 1 and 0
+  vector[J] p[S, N]; // detection probability
+  vector[N] py[S]; // probability of sequence of detections at site i
+  vector[N] mar_lik; // marginal likelihood
+  
+  // natural parameters
+  f[1:N, 1] = x * beta[1];  // f1
+  f[1:N, 2] = x * beta[2];  // f2
+  f[1:N, 3] = x * beta[3];  // f3
+  f[1:N, 4] = x * beta[4];  // f12
+  f[1:N, 5] = x * beta[5];  // f13
+  f[1:N, 6] = x * beta[6];  // f23
+  f[1:N, 7] = rep_vector(0, N);  // f123
+  
+  for(i in 1:N){  // looping through all sites
+  
+    // intermediate step -- numerator of multinomial logit
+    num[i, 1] = sum(f[i, 1:7]);              // 111
+    num[i, 2] = f[i, 1] + f[i, 2] + f[i, 4]; // 110
+    num[i, 3] = f[i, 1] + f[i, 3] + f[i, 5]; // 101
+    num[i, 4] = f[i, 1];                     // 100
+    num[i, 5] = f[i, 2] + f[i, 3] + f[i, 6]; // 011
+    num[i, 6] = f[i, 2];                     // 010
+    num[i, 7] = f[i, 3];                     // 001
+    num[i, 8] = 0;                           // 000
+  
+    psi[i] = softmax(num[i]);  // multinomial logit link function
+    
+    for(j in 1:J){  // looping through all replicate surveys
+    
+      // detection probability
+      p[1, i, j] = inv_logit(w[i, j] * alpha[1]);
+      p[2, i, j] = inv_logit(w[i, j] * alpha[2]);
+      p[3, i, j] = inv_logit(w[i, j] * alpha[3]);
+    
+    }
+    
+    // probability of detection history.
+    // calculate once now so I don't have to keep doing later
+    py[1, i] = prod(exp(y[1, i] .* log(p[1, i]) +
+                    (1 - y[1, i]) .* log(1 - p[1, i])));
+    py[2, i] = prod(exp(y[2, i] .* log(p[2, i]) +
+                    (1 - y[2, i]) .* log(1 - p[2, i])));
+    py[3, i] = prod(exp(y[3, i] .* log(p[3, i]) +
+                    (1 - y[3, i]) .* log(1 - p[3, i])));
+              
+    
+    // marginal likelihood
+    mar_lik[i] =
+      psi[i][1] * py[1, i] * py[2, i] * py[3, i] +                     // 111
+      psi[i][2] * py[1, i] * py[2, i] * (1 - ind[i, 3]) +              // 110
+      psi[i][3] * py[1, i] * (1 - ind[i, 2]) * py[3, i] +              // 101
+      psi[i][4] * py[1, i] * (1 - ind[i, 2]) * (1 - ind[i, 3]) +       // 100
+      psi[i][5] * (1 - ind[i, 1]) * py[2, i] * py[3, i] +              // 011
+      psi[i][6] * (1 - ind[i, 1]) * py[2, i] * (1 - ind[i, 3]) +       // 010
+      psi[i][7] * (1 - ind[i, 1]) * (1 - ind[i, 2]) * py[3, i] +       // 001
+      psi[i][8] * (1 - ind[i, 1]) * (1 - ind[i, 2]) * (1 - ind[i, 3]); // 000
+      
+  }
+
+}
+
+model{
+
+  for(s in 1:S){
+    alpha[s] ~ logistic(0, 1);
+  }
+  
+  for(t in 1:6){
+    beta[t] ~ logistic(0, 1);
+  }
+  
+  
+  target += log(mar_lik);
+  
+}
+
+```
+
+```{r}
+# reading in data
+bob <- read.csv('data/Bobcat_3wk.csv')  # bobcat detection / non-detection data
+coy <- read.csv('data/Coyote_3wk.csv')  # coyote detection / non-detection data
+fox <- read.csv('data/RedFox_3wk.csv')  # fox detection / non-detection data
+x <- read.csv('data/psi_cov3wk.csv')  # site level covariates
+w <- read.csv('data/detection data.csv')   # detection-level covariates
+
+# putting detection / non-detection data into an array
+y <- array(dim = c(3, nrow(bob), ncol(bob)))
+y[1, , ] <- as.matrix(bob)
+y[2, , ] <- as.matrix(coy)
+y[3, , ] <- as.matrix(fox)
+
+# creating design matrix for detection / non-detection data
+dm_w <- array(1, dim = c(nrow(bob), ncol(bob), 2))
+dm_w[, 1, 2] <- scale(w)[, 1]
+dm_w[, 2, 2] <- scale(w)[, 2]
+dm_w[, 3, 2] <- scale(w)[, 3]
+
+# creating a list for output to stan
+data <- list(
+  J = ncol(bob),  # no. replicate observations
+  N = nrow(bob),  # no. sites
+  S = 3,  # number of species
+  y = y,  # detection / non-detection data
+  ind = cbind(apply(as.matrix(bob), 1, max), # is species detected?
+              apply(as.matrix(coy), 1, max),
+              apply(as.matrix(fox), 1, max)),  
+  x = cbind(rep(1, nrow(bob)), # 1st order design matrix
+             scale(x$Dist_5km)[, 1],
+             scale(x$HDens_5km)[, 1]),
+  w = dm_w  # detection-level design matrix
+)
+```
+
+We'll specify parameters to monitor:
+
+```{r, results = 'hide'}
+params <- c('alpha', 'beta')
+```
+
+tweak the `inits()` function:
+
+```{r, results = 'hide'}
+inits <- function(){
+  list(
+    alpha = matrix(rnorm(3 * 2), nrow = 3),
+    beta = matrix(rnorm(3 * 6), nrow = 6)
+  )
+}
+
+```
+
+send the model off to STAN:
+
+```{r, results = 'hide', message = FALSE}
+library(rstan)
+options(mc.cores = parallel::detectCores())  # for parallel processing
+
+fit_3sp <- sampling(model_3sp_MARK, data = data, pars = params, chains = 3,
+                    init = inits, iter = 200, warmup = 100, thin = 1, cores = 3)
+```        
